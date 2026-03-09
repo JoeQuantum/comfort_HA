@@ -373,16 +373,17 @@ class KumoCloudClimate(CoordinatorEntity, ClimateEntity):
         profile = self.device.profile_data
         if profile:
             profile_data = profile[0] if isinstance(profile, list) else profile
+            max_setpoints = profile_data.get("maximumSetPoints", {})
 
-            if profile_data.get("hasModeHeat", False):
+            if profile_data.get("hasModeHeat", False) or "heat" in max_setpoints:
                 modes.append(HVACMode.HEAT)
-            if profile_data.get("hasModeCool", False):
+            if profile_data.get("hasModeCool", False) or "cool" in max_setpoints:
                 modes.append(HVACMode.COOL)
             if profile_data.get("hasModeDry", False):
                 modes.append(HVACMode.DRY)
-            if profile_data.get("hasModeFan", False):
+            if profile_data.get("hasModeFan", False) or profile_data.get("hasModeVent", False):
                 modes.append(HVACMode.FAN_ONLY)
-            if profile_data.get("hasModeAuto", False):
+            if profile_data.get("hasModeAuto", False) or "auto" in max_setpoints:
                 modes.append(HVACMode.HEAT_COOL)
         else:
             modes.extend([HVACMode.HEAT, HVACMode.COOL])
