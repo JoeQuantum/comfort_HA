@@ -422,7 +422,7 @@ class KumoCloudClimate(KumoCloudEntity, ClimateEntity):
             and self.device.device_data
             and self.coordinator.data is not None
         )
-        return has_data and self.device.available
+        return has_data
 
     # ---- Commands -----------------------------------------------------------
 
