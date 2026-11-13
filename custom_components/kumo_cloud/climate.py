@@ -133,10 +133,10 @@ _DIRECT_MODE_ACTIONS: dict[str, HVACAction] = {
 # sign = +1 -> HEATING (IDLE when current >= target + deadband)
 # sign = -1 -> COOLING (IDLE when current <= target - deadband)
 _DELTA_MODE_ACTIONS: dict[str, tuple[HVACAction, str, int]] = {
-    OPERATION_MODE_HEAT:      (HVACAction.HEATING, "target_temperature",      +1),
-    OPERATION_MODE_AUTO_HEAT: (HVACAction.HEATING, "target_temperature_low",  +1),
-    OPERATION_MODE_COOL:      (HVACAction.COOLING, "target_temperature",      -1),
-    OPERATION_MODE_AUTO_COOL: (HVACAction.COOLING, "target_temperature_high", -1),
+    OPERATION_MODE_HEAT:      (HVACAction.HEATING, "native_target_temperature",      +1),
+    OPERATION_MODE_AUTO_HEAT: (HVACAction.HEATING, "native_target_temperature_low",  +1),
+    OPERATION_MODE_COOL:      (HVACAction.COOLING, "native_target_temperature",      -1),
+    OPERATION_MODE_AUTO_COOL: (HVACAction.COOLING, "native_target_temperature_high", -1),
 }
 
 # Throttle service calls so a Lovelace card mashing set_temperature does
@@ -167,6 +167,9 @@ async def async_setup_entry(
 class KumoCloudClimate(KumoCloudEntity, ClimateEntity):
     """Representation of a Kumo Cloud climate device."""
 
+    _attr_native_temperature_unit = UnitOfTemperature.FAHRENHEIT
+    # Home Assistant before 2026.11 reads the unit from here. A class that provides both
+    # this and the native member gets the native one and no deprecation warning.
     _attr_temperature_unit = UnitOfTemperature.FAHRENHEIT
     _attr_name = None
     _enable_turn_on_off_backwards_compatibility = False
@@ -210,7 +213,7 @@ class KumoCloudClimate(KumoCloudEntity, ClimateEntity):
     # ---- Temperature properties ---------------------------------------------
 
     @property
-    def current_temperature(self) -> float | None:
+    def native_current_temperature(self) -> float | None:
         """Return the current temperature (converted to Fahrenheit)."""
         adapter = self.device.zone_data.get("adapter", {})
         return c_to_f(adapter.get("roomTemp"))
@@ -223,7 +226,7 @@ class KumoCloudClimate(KumoCloudEntity, ClimateEntity):
         return device_data.get("humidity", adapter.get("humidity"))
 
     @property
-    def target_temperature(self) -> float | None:
+    def native_target_temperature(self) -> float | None:
         """Return the target temperature for single-setpoint modes."""
         adapter = self.device.zone_data.get("adapter", {})
         hvac_mode = self.hvac_mode
@@ -233,11 +236,11 @@ class KumoCloudClimate(KumoCloudEntity, ClimateEntity):
         elif hvac_mode == HVACMode.HEAT:
             return c_to_f(adapter.get("spHeat"))
 
-        # HEAT_COOL uses target_temperature_high/low instead
+        # HEAT_COOL uses native_target_temperature_high/low instead
         return None
 
     @property
-    def target_temperature_high(self) -> float | None:
+    def native_target_temperature_high(self) -> float | None:
         """Return the upper bound temperature for heat/cool mode."""
         if self.hvac_mode == HVACMode.HEAT_COOL:
             adapter = self.device.zone_data.get("adapter", {})
@@ -246,13 +249,19 @@ class KumoCloudClimate(KumoCloudEntity, ClimateEntity):
         return None
 
     @property
-    def target_temperature_low(self) -> float | None:
+    def native_target_temperature_low(self) -> float | None:
         """Return the lower bound temperature for heat/cool mode."""
         if self.hvac_mode == HVACMode.HEAT_COOL:
             adapter = self.device.zone_data.get("adapter", {})
             device_data = self.device.device_data
             return c_to_f(device_data.get("spHeat", adapter.get("spHeat")))
         return None
+
+    # Home Assistant before 2026.11 reads these names instead of the native ones.
+    current_temperature = native_current_temperature
+    target_temperature = native_target_temperature
+    target_temperature_high = native_target_temperature_high
+    target_temperature_low = native_target_temperature_low
 
     @property
     def min_temp(self) -> float:
@@ -344,7 +353,7 @@ class KumoCloudClimate(KumoCloudEntity, ClimateEntity):
 
         if operation_mode in _DELTA_MODE_ACTIONS:
             action, setpoint_attr, sign = _DELTA_MODE_ACTIONS[operation_mode]
-            current = self.current_temperature
+            current = self.native_current_temperature
             target = getattr(self, setpoint_attr)
             if current is not None and target is not None:
                 if sign > 0 and current >= target + HVAC_ACTION_DEADBAND_F:
@@ -354,8 +363,8 @@ class KumoCloudClimate(KumoCloudEntity, ClimateEntity):
             return action
 
         if operation_mode == OPERATION_MODE_AUTO:
-            current = self.current_temperature
-            target = self.target_temperature_high or self.target_temperature
+            current = self.native_current_temperature
+            target = self.native_target_temperature_high or self.native_target_temperature
             if current is not None and target is not None:
                 diff = current - target
                 if diff > HVAC_ACTION_DEADBAND_F:
