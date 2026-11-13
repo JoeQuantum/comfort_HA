@@ -11,13 +11,28 @@ import aiohttp
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 
 from .api import KumoCloudAPI, KumoCloudAuthError, KumoCloudConnectionError
-from .const import DOMAIN, DEFAULT_SCAN_INTERVAL
+from .const import DOMAIN, DEFAULT_SCAN_INTERVAL, DEVICE_TELEMETRY_MAX_AGE
 
 type KumoCloudConfigEntry = ConfigEntry["KumoCloudDataUpdateCoordinator"]
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _parse_updated_at(value: Any) -> datetime | None:
+    """Read a timezone-aware device timestamp without trusting malformed data."""
+    if not isinstance(value, str):
+        return None
+    try:
+        updated = dt_util.parse_datetime(value)
+    except (ValueError, OverflowError):
+        return None
+    if updated is None or updated.tzinfo is None:
+        return None
+    return updated
+
 
 class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
     """Class to manage fetching Kumo Cloud data."""
@@ -34,6 +49,9 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
         self.site_id = site_id
         self.zones: list[dict[str, Any]] = []
         self.devices: dict[str, dict[str, Any]] = {}
+        # Record actual detail-fetch success before pending commands can make
+        # an empty/failed response look like populated device data.
+        self.device_update_success: dict[str, bool] = {}
         self.device_profiles: dict[str, list[dict[str, Any]]] = {}
         self.wireless_sensors: dict[str, dict[str, Any]] = {}
         self.device_statuses: dict[str, dict[str, Any]] = {}
@@ -61,6 +79,7 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
 
             # Get device details for each zone
             devices = {}
+            device_update_success = {}
             device_profiles = {}
             wireless_sensors = {}
             device_statuses = {}
@@ -97,6 +116,7 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
                             result_map[key] = result
 
                     device_detail = result_map.get("detail") or {}
+                    device_update_success[device_serial] = bool(device_detail)
 
                     # Process pending commands for the device
                     self._process_pending_commands(device_serial, device_detail)
@@ -116,6 +136,7 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
             # Store the data for access by entities
             self.zones = zones
             self.devices = devices
+            self.device_update_success = device_update_success
             self.device_profiles = device_profiles
             self.wireless_sensors = wireless_sensors
             self.device_statuses = device_statuses
@@ -156,6 +177,7 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
         try:
             # Get fresh device details
             device_detail = await self.api.get_device_details(device_serial)
+            self.device_update_success[device_serial] = bool(device_detail)
 
             # Process pending commands for the device
             self._process_pending_commands(device_serial, device_detail)
@@ -204,6 +226,8 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
             OSError,
             asyncio.TimeoutError,
         ) as err:
+            self.device_update_success[device_serial] = False
+            self.async_update_listeners()
             _LOGGER.warning("Failed to refresh device %s: %s", device_serial, err)
 
     def cache_command(self, device_serial: str, command: str, value: Any) -> None:
@@ -214,8 +238,10 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
 
     def cull_cached_commands(self, device_serial: str, date: str) -> None:
         """Remove cached commands for a device where the date is on or after the item's timestamp."""
+        input_date = _parse_updated_at(date)
+        if input_date is None:
+            return
         to_remove = []
-        input_date = datetime.fromisoformat(date)
 
         for key, value in self.cached_commands.items():
             cached_device_serial, command = key
@@ -311,15 +337,31 @@ class KumoCloudDevice:
 
     @property
     def available(self) -> bool:
-        """Return True if device is available."""
-        adapter = self.zone_data.get("adapter", {})
+        """Require a successful refresh and evidence the device is online."""
+        zone_data = self.zone_data
         device_data = self.device_data
+        if (
+            not self.coordinator.last_update_success
+            or not self.coordinator.device_update_success.get(self.device_serial, False)
+            or not zone_data
+            or not device_data
+        ):
+            return False
 
-        # Check both adapter and device data for connection status
+        adapter = zone_data.get("adapter", {})
         adapter_connected = adapter.get("connected", False)
         device_connected = device_data.get("connected", adapter_connected)
+        if device_connected is True:
+            return True
 
-        return device_connected
+        # The cloud can report connected=False for a working device. Only
+        # override it when the device response itself has recent telemetry;
+        # cached commands, zone metadata, and HTTP fetch time are not proof.
+        updated = _parse_updated_at(device_data.get("updatedAt"))
+        if updated is None:
+            return False
+        age = (dt_util.utcnow() - updated).total_seconds()
+        return 0 <= age <= DEVICE_TELEMETRY_MAX_AGE
 
     @property
     def name(self) -> str:

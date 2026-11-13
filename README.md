@@ -96,6 +96,21 @@ All entities for a given indoor unit are grouped under a single HA device. The d
 
 ## Behavior notes
 
+### Availability
+
+The thermostat becomes unavailable when a site poll or its device-detail
+refresh fails, or when its zone/device data is missing. Cached commands do
+not count as a successful refresh.
+
+Some working units are incorrectly reported as disconnected by the cloud.
+When the connection flag is false or missing, the integration accepts the
+device response's `updatedAt` timestamp as a fallback for up to five minutes.
+Repeatedly fetching the same old response does not extend that window.
+Missing, invalid, timezone-less, or future timestamps cannot override an
+offline flag. With normal one-minute polling, expiration is reflected on
+the next poll. This is a bounded cloud-telemetry heuristic, not a direct
+network reachability check.
+
 ### HVAC idle inference
 
 The Kumo Cloud V3 API does not expose a "compressor running" signal — only the
