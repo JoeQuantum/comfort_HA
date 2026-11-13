@@ -26,3 +26,8 @@ OPERATION_MODE_AUTO_HEAT = "autoHeat"
 
 # Coordinator polling
 DEFAULT_SCAN_INTERVAL = 60
+
+# A false connection flag may be overridden by device telemetry for at most
+# five normal polling intervals. Re-reading the same cloud snapshot does not
+# extend this window.
+DEVICE_TELEMETRY_MAX_AGE = 5 * DEFAULT_SCAN_INTERVAL

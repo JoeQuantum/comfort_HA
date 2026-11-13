@@ -1,0 +1,24 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  availability:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        home-assistant: ["2026.10.0", "2026.11.0"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install Home Assistant
+        run: python -m pip install 'homeassistant==${{ matrix.home-assistant }}'
+      - name: Run regression tests
+        run: python -m unittest discover -s tests -v
