@@ -1,5 +1,43 @@
 # Changelog
 
+## [1.4.2] - 2026-11-13
+
+Fixes Home Assistant 2026.11 temperature API warnings and incorrect
+unavailability reports while preserving offline detection.
+
+### Fixed
+
+- **Native climate temperature API.** Provides the new `native_*`
+  temperature properties and unit, removing all five deprecation warnings
+  on Home Assistant 2026.11. Legacy properties remain available for older
+  Home Assistant versions. Thanks to @kris-anderson for the report and
+  [PR #3](https://github.com/JoeQuantum/comfort_HA/pull/3).
+- **Incorrect connection flags.** A false or missing cloud connection
+  flag can be overridden by device telemetry up to five minutes old.
+  Re-fetching an old snapshot does not extend that window. Failed site or
+  device-detail refreshes and missing data still make the thermostat
+  unavailable, and stale telemetry cannot override an offline flag.
+  A successful refresh restores availability when the device is connected
+  or has fresh telemetry. Thanks to @billg118 for the
+  report and initial fix in
+  [PR #1](https://github.com/JoeQuantum/comfort_HA/pull/1).
+- **Pending commands and invalid timestamps.** Cached commands no longer
+  mask failed device refreshes, and malformed update timestamps no longer
+  interrupt pending-command processing.
+
+### Validation
+
+- 27 availability regression tests pass on both Home Assistant 2026.10.0
+  and 2026.11.0. HACS validation passes.
+- Temperature behavior was checked across Celsius and Fahrenheit,
+  including 28 state cases and 42 command cases on each HA version.
+- Cloud responses are mocked in tests; the availability fallback is a
+  bounded telemetry heuristic rather than a direct reachability probe.
+
+### Updating
+
+Update Mitsubishi Comfort in HACS, then restart Home Assistant.
+
 ## [1.4.1] - 2026-05-29
 
 A cohesion pass: aligns module headers, finishes the exception-narrowing
