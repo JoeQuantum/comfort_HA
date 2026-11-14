@@ -1,5 +1,6 @@
 """Mode/temperature service behavior in Celsius and Fahrenheit."""
 
+from copy import deepcopy
 from unittest.mock import AsyncMock
 
 from homeassistant.components.climate import HVACMode
@@ -8,12 +9,13 @@ try:
     from homeassistant.components.climate.services import _async_service_temperature_set
 except ImportError:  # HA 2026.10, before climate services moved into their own module.
     from homeassistant.components.climate import _async_service_temperature_set
-from helpers import IntegrationTestCase
+from helpers import IntegrationTestCase, detail
 from homeassistant.const import UnitOfTemperature
 from homeassistant.core import ServiceCall
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.util.unit_system import METRIC_SYSTEM
 
+from custom_components.kumo_cloud.api import KumoCloudConnectionError
 from custom_components.kumo_cloud.temperature import F_TO_C
 
 
@@ -140,3 +142,54 @@ class ClimateCommandTests(IntegrationTestCase):
         self.assertEqual(command["spCool"], 18)
         self.coordinator.devices["unit-a"]["roomTemp"] = 18
         self.assertEqual(self.entity.native_current_temperature, 18)
+
+    async def test_profile_failure_preserves_auto_range_commands_and_capabilities(self):
+        original_profile = self.device.profile_data
+        self.api.get_device_details.side_effect = lambda _: detail(
+            operationMode="autoHeat"
+        )
+        self.api.get_device_profile.side_effect = KumoCloudConnectionError(
+            "Profile timeout"
+        )
+        for _ in range(3):
+            await self.coordinator.async_refresh()
+            self.assertTrue(self.entity.available)
+            self.assertEqual(self.device.profile_data, original_profile)
+            self.assertIn(HVACMode.HEAT_COOL, self.entity.hvac_modes)
+            command = await self.service(target_temp_low=68, target_temp_high=77)
+            self.assertEqual(command, {"spHeat": 20, "spCool": 25})
+
+    async def test_empty_profile_response_preserves_last_valid_profile(self):
+        original_profile = self.device.profile_data
+        self.api.get_device_profile.side_effect = None
+        for response in (None, [], {}):
+            with self.subTest(response=response):
+                self.api.get_device_profile.return_value = response
+                await self.coordinator.async_refresh()
+                self.assertEqual(self.device.profile_data, original_profile)
+                self.assertIn(HVACMode.HEAT_COOL, self.entity.hvac_modes)
+
+    async def test_profile_recovery_updates_capabilities_and_temperature_validation(
+        self,
+    ):
+        profile = deepcopy(self.device.profile_data)
+        self.api.get_device_profile.side_effect = KumoCloudConnectionError(
+            "Profile timeout"
+        )
+        await self.coordinator.async_refresh()
+        profile[0]["minimumSetPoints"]["heat"] = 21
+        self.api.get_device_profile.side_effect = None
+        self.api.get_device_profile.return_value = profile
+        await self.coordinator.async_refresh()
+        self.assertEqual(self.device.profile_data, profile)
+        with self.assertRaises(ServiceValidationError):
+            await self.service(temperature=68, hvac_mode=HVACMode.HEAT)
+        self.entity._send_command_and_refresh.assert_not_awaited()
+        command = await self.service(temperature=72, hvac_mode=HVACMode.HEAT)
+        self.assertEqual(command["spHeat"], 22.5)
+
+    async def test_removed_devices_do_not_retain_profile_cache(self):
+        self.api.get_zones.side_effect = None
+        self.api.get_zones.return_value = []
+        await self.coordinator.async_refresh()
+        self.assertEqual(self.coordinator.device_profiles, {})

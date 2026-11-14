@@ -11,15 +11,22 @@
   starts Home Assistant reauthentication.
 - Pending commands are tracked only after cloud acceptance, separately from
   telemetry. Matching values confirm them; otherwise they expire after two
-  minutes. Command timeouts are not automatically replayed.
+  minutes. Command timeouts are not automatically replayed. Older polls and
+  command readbacks cannot overwrite newer device state or availability.
+- Temporary failures or empty responses from the optional device-profile
+  endpoint retain the last valid capabilities and temperature limits. A later
+  successful profile refresh updates them; removed devices drop their profiles.
 - Celsius readings and setpoints avoid the Fahrenheit lookup round trip.
   Fahrenheit app mappings are preserved, and live HA unit changes are supported.
 - Diagnostics redact account identity, device and zone map keys, and private
   names while preserving useful measurements and anonymous device correlation.
+  Discovery metadata is also redacted so DHCP MAC addresses and hostnames cannot
+  leak through serialized Home Assistant discovery-key objects.
 
 ### Validation
 
-- Regression coverage includes climate services, authentication concurrency and
+- 87 regression tests pass on Home Assistant 2026.10.0 and 2026.11.0. Coverage
+  includes climate services, authentication concurrency and
   persistence, pending command expiry and rejection, diagnostics, and the
   existing availability cases. All cloud I/O is mocked.
 

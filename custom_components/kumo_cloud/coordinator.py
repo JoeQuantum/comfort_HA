@@ -86,6 +86,12 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
         self.device_revisions: dict[str, int] = {}
         self._pending_expiry: asyncio.TimerHandle | None = None
 
+    def next_device_revision(self, device_serial: str) -> int:
+        """Order reads and accepted commands before they can update device state."""
+        revision = self.device_revisions.get(device_serial, 0) + 1
+        self.device_revisions[device_serial] = revision
+        return revision
+
     def _process_pending_commands(
         self, device_serial: str, device_detail: dict[str, Any]
     ) -> None:
@@ -124,9 +130,7 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
             for zone in zones:
                 if zone.get("adapter"):
                     device_serial = zone["adapter"]["deviceSerial"]
-                    revisions[device_serial] = self.device_revisions.get(
-                        device_serial, 0
-                    )
+                    revisions[device_serial] = self.next_device_revision(device_serial)
                     zone_id = zone["id"]
                     has_sensor = zone["adapter"].get("hasSensor", False)
 
@@ -167,7 +171,11 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
                     device_update_success[device_serial] = bool(device_detail)
 
                     devices[device_serial] = device_detail
-                    device_profiles[device_serial] = result_map.get("profile") or []
+                    # Capabilities are stable metadata. A failed/empty optional
+                    # response must not disable controls on an otherwise online unit.
+                    device_profiles[device_serial] = result_map.get(
+                        "profile"
+                    ) or self.device_profiles.get(device_serial, [])
 
                     if result_map.get("status"):
                         device_statuses[device_serial] = result_map["status"]
@@ -178,8 +186,8 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
                     if has_sensor and result_map.get("sensor"):
                         wireless_sensors[device_serial] = result_map["sensor"]
 
-            # A poll can overlap a command and its newer readback while fetching
-            # other endpoints/units. Never replace that state with the older poll.
+            # A poll can overlap another read or an accepted command while fetching
+            # other endpoints/units. Only the latest request may publish device state.
             for serial, detail in devices.items():
                 if revisions[serial] != self.device_revisions.get(serial, 0):
                     devices[serial] = self.devices.get(serial, {})
@@ -217,12 +225,12 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
 
     async def async_refresh_device(self, device_serial: str) -> None:
         """Refresh a specific device's data immediately."""
-        self.device_revisions[device_serial] = (
-            self.device_revisions.get(device_serial, 0) + 1
-        )
+        revision = self.next_device_revision(device_serial)
         try:
             # Get fresh device details
             device_detail = await self.api.get_device_details(device_serial)
+            if revision != self.device_revisions.get(device_serial):
+                return
             self.device_update_success[device_serial] = bool(device_detail)
 
             # Process pending commands for the device
@@ -268,6 +276,7 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER.debug("Refreshed device %s data", device_serial)
 
         except KumoCloudAuthError as err:
+            # Authentication is account-wide, even when this read was superseded.
             self.device_update_success[device_serial] = False
             self.async_auth_failed()
             raise ConfigEntryAuthFailed("Cloud authentication failed") from err
@@ -277,6 +286,8 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
             aiohttp.ClientError,
             OSError,
         ) as err:
+            if revision != self.device_revisions.get(device_serial):
+                return
             self.device_update_success[device_serial] = False
             self.async_update_listeners()
             _LOGGER.warning("Failed to refresh device %s: %s", device_serial, err)
@@ -456,9 +467,7 @@ class KumoCloudDevice:
                 self.coordinator.async_auth_failed()
                 raise ConfigEntryAuthFailed("Cloud authentication failed") from err
 
-            self.coordinator.device_revisions[self.device_serial] = (
-                self.coordinator.device_revisions.get(self.device_serial, 0) + 1
-            )
+            self.coordinator.next_device_revision(self.device_serial)
             for command, value in commands.items():
                 self.coordinator.cache_command(self.device_serial, command, value)
             self.coordinator.async_update_listeners()

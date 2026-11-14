@@ -123,3 +123,48 @@ class DiagnosticsTests(IntegrationTestCase):
         ):
             self.assertNotIn(secret, encoded)
         self.assertEqual(entry.data["password"], "password-secret")
+
+    async def test_real_discovery_keys_do_not_expose_mac_or_hostname_after_serialization(
+        self,
+    ):
+        from types import MappingProxyType
+
+        import orjson
+        from homeassistant.config_entries import ConfigEntry
+        from homeassistant.helpers.discovery_flow import DiscoveryKey
+
+        mac = "aa:bb:cc:dd:ee:ff"
+        hostname = "private-bedroom-adapter.local"
+        for key in (mac, (mac, hostname)):
+            with self.subTest(key=key):
+                discovery = DiscoveryKey(domain="dhcp", key=key, version=1)
+                entry = ConfigEntry(
+                    data={
+                        "username": "real@example.invalid",
+                        "password": "password-secret",
+                    },
+                    discovery_keys=MappingProxyType({"dhcp": (discovery,)}),
+                    domain="kumo_cloud",
+                    minor_version=1,
+                    options={},
+                    source="dhcp",
+                    subentries_data=[],
+                    title="Private home",
+                    unique_id="real@example.invalid",
+                    version=1,
+                )
+                entry.runtime_data = self.coordinator
+                result = await async_get_config_entry_diagnostics(self.hass, entry)
+                encoded = orjson.dumps(result).decode()
+                for secret in (
+                    mac,
+                    hostname,
+                    "real@example.invalid",
+                    "password-secret",
+                    "Private home",
+                ):
+                    self.assertNotIn(secret, encoded)
+                self.assertEqual(result["config_entry"]["source"], "dhcp")
+                self.assertEqual(result["devices"]["device_1"]["roomTemp"], 22)
+                self.assertIs(entry.discovery_keys["dhcp"][0], discovery)
+                self.assertEqual(discovery.key, key)

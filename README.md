@@ -133,11 +133,17 @@ matching device reading. Pending settings are kept separately from telemetry
 and expire after two minutes, even if `updatedAt` is missing or malformed.
 Rejected commands do not become pending state, and a timed-out command is not
 automatically resent because the cloud may already have accepted it.
+Overlapping polls and command readbacks use a shared request sequence so an
+older response cannot overwrite newer readings or availability.
 
 Combined `climate.set_temperature` calls validate the requested HVAC mode and
 temperature together, then submit one command. For example, a call with
 `hvac_mode: heat` sets the heating target even when the unit is currently cooling
 or off.
+
+Temporary failures or empty responses from the optional device-profile endpoint
+retain the last valid capabilities and temperature limits, allowing controls to
+continue working. A successful profile refresh replaces the cached profile.
 
 ### Temperature conversion
 

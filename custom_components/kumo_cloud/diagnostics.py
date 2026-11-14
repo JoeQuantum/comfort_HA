@@ -39,6 +39,8 @@ TO_REDACT = {
     "zoneId",
     "serial",
     "address",
+    # HA DiscoveryKey objects can contain MACs/hostnames outside normal dict fields.
+    "discovery_keys",
 }
 
 
