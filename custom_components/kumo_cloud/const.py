@@ -27,6 +27,9 @@ OPERATION_MODE_AUTO_HEAT = "autoHeat"
 # Coordinator polling
 DEFAULT_SCAN_INTERVAL = 60
 
+# Optimistic settings expire after two normal polls, even without updatedAt.
+COMMAND_CACHE_TTL = 2 * DEFAULT_SCAN_INTERVAL
+
 # A false connection flag may be overridden by device telemetry for at most
 # five normal polling intervals. Re-reading the same cloud snapshot does not
 # extend this window.

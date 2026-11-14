@@ -1,5 +1,35 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Combined mode/temperature service calls apply the requested mode and the
+  corresponding setpoint in one command, with validation before sending.
+- Authentication recovery is bounded and shared across concurrent requests.
+  Token rotations are persisted, and exhausted polling or command authentication
+  starts Home Assistant reauthentication.
+- Pending commands are tracked only after cloud acceptance, separately from
+  telemetry. Matching values confirm them; otherwise they expire after two
+  minutes. Command timeouts are not automatically replayed. Older polls and
+  command readbacks cannot overwrite newer device state or availability.
+- Temporary failures or empty responses from the optional device-profile
+  endpoint retain the last valid capabilities and temperature limits. A later
+  successful profile refresh updates them; removed devices drop their profiles.
+- Celsius readings and setpoints avoid the Fahrenheit lookup round trip.
+  Fahrenheit app mappings are preserved, and live HA unit changes are supported.
+- Diagnostics redact account identity, device and zone map keys, and private
+  names while preserving useful measurements and anonymous device correlation.
+  Discovery metadata is also redacted so DHCP MAC addresses and hostnames cannot
+  leak through serialized Home Assistant discovery-key objects.
+
+### Validation
+
+- 87 regression tests pass on Home Assistant 2026.10.0 and 2026.11.0. Coverage
+  includes climate services, authentication concurrency and
+  persistence, pending command expiry and rejection, diagnostics, and the
+  existing availability cases. All cloud I/O is mocked.
+
 ## [1.4.2] - 2026-11-13
 
 Fixes Home Assistant 2026.11 temperature API warnings and incorrect

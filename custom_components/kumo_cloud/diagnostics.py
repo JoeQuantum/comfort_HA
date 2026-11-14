@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
-from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceEntry
 
 from .const import DOMAIN
-from .coordinator import KumoCloudConfigEntry
+from .coordinator import KumoCloudConfigEntry, KumoCloudDataUpdateCoordinator
 
 # Keys redacted from any nested dict before the diagnostics blob is exposed.
 TO_REDACT = {
@@ -28,7 +28,52 @@ TO_REDACT = {
     "ssid",
     "routerSsid",
     "ipAddress",
+    "email",
+    "unique_id",
+    "title",
+    "name",
+    "id",
+    "site_id",
+    "siteId",
+    "zone_id",
+    "zoneId",
+    "serial",
+    "address",
+    # HA DiscoveryKey objects can contain MACs/hostnames outside normal dict fields.
+    "discovery_keys",
 }
+
+
+def _redact(data: Any, identifiers: dict[str, str]) -> Any:
+    """Redact identities in values and dictionary keys without changing source data."""
+    if isinstance(data, Mapping):
+        return {
+            identifiers.get(key, key): (
+                "**REDACTED**" if key in TO_REDACT else _redact(value, identifiers)
+            )
+            for key, value in data.items()
+        }
+    if isinstance(data, (list, tuple)):
+        return [_redact(value, identifiers) for value in data]
+    if isinstance(data, str) and data in identifiers:
+        return "**REDACTED**"
+    return data
+
+
+def _identifiers(coordinator: KumoCloudDataUpdateCoordinator) -> dict[str, str]:
+    """Use consistent anonymous labels across the per-device diagnostic maps."""
+    serials = set().union(
+        coordinator.devices,
+        coordinator.device_profiles,
+        coordinator.device_statuses,
+        coordinator.wireless_sensors,
+    )
+    identifiers = {serial: f"device_{i}" for i, serial in enumerate(sorted(serials), 1)}
+    zones = set(coordinator.zone_notifications) | {
+        zone["id"] for zone in coordinator.zones if "id" in zone
+    }
+    identifiers.update({zone: f"zone_{i}" for i, zone in enumerate(sorted(zones), 1)})
+    return identifiers
 
 
 async def async_get_config_entry_diagnostics(
@@ -36,17 +81,18 @@ async def async_get_config_entry_diagnostics(
 ) -> dict[str, Any]:
     """Return diagnostics for a config entry."""
     coordinator = entry.runtime_data
-    return {
-        "config_entry": async_redact_data(entry.as_dict(), TO_REDACT),
-        "zones": async_redact_data(coordinator.zones, TO_REDACT),
-        "devices": async_redact_data(coordinator.devices, TO_REDACT),
-        "device_profiles": async_redact_data(coordinator.device_profiles, TO_REDACT),
-        "device_statuses": async_redact_data(coordinator.device_statuses, TO_REDACT),
-        "wireless_sensors": async_redact_data(coordinator.wireless_sensors, TO_REDACT),
-        "zone_notifications": async_redact_data(
-            coordinator.zone_notifications, TO_REDACT
-        ),
-    }
+    return _redact(
+        {
+            "config_entry": entry.as_dict(),
+            "zones": coordinator.zones,
+            "devices": coordinator.devices,
+            "device_profiles": coordinator.device_profiles,
+            "device_statuses": coordinator.device_statuses,
+            "wireless_sensors": coordinator.wireless_sensors,
+            "zone_notifications": coordinator.zone_notifications,
+        },
+        _identifiers(coordinator),
+    )
 
 
 async def async_get_device_diagnostics(
@@ -64,23 +110,18 @@ async def async_get_device_diagnostics(
     if serial is None:
         return {"error": "device serial not found in identifiers"}
 
-    return {
-        "device_info": {
-            "name": device.name,
-            "model": device.model,
-            "sw_version": device.sw_version,
-            "manufacturer": device.manufacturer,
+    return _redact(
+        {
+            "device_info": {
+                "name": device.name,
+                "model": device.model,
+                "sw_version": device.sw_version,
+                "manufacturer": device.manufacturer,
+            },
+            "device_data": coordinator.devices.get(serial, {}),
+            "device_status": coordinator.device_statuses.get(serial, {}),
+            "device_profile": coordinator.device_profiles.get(serial, []),
+            "wireless_sensor": coordinator.wireless_sensors.get(serial, {}),
         },
-        "device_data": async_redact_data(
-            coordinator.devices.get(serial, {}), TO_REDACT
-        ),
-        "device_status": async_redact_data(
-            coordinator.device_statuses.get(serial, {}), TO_REDACT
-        ),
-        "device_profile": async_redact_data(
-            coordinator.device_profiles.get(serial, []), TO_REDACT
-        ),
-        "wireless_sensor": async_redact_data(
-            coordinator.wireless_sensors.get(serial, {}), TO_REDACT
-        ),
-    }
+        _identifiers(coordinator),
+    )

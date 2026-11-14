@@ -127,11 +127,23 @@ of power.
 
 ### Command caching
 
-The Comfort cloud API can take up to a minute to reflect a command. The
-integration caches commands locally with a timestamp and keeps them applied
-to the entity state until the server's `updatedAt` field confirms the command
-was processed. This eliminates the visible "bounce" where a slider would snap
-back to its previous value a second after you moved it.
+The Comfort cloud API can take up to a minute to reflect a command. After the
+cloud accepts a setting, the climate entity displays it while waiting for a
+matching device reading. Pending settings are kept separately from telemetry
+and expire after two minutes, even if `updatedAt` is missing or malformed.
+Rejected commands do not become pending state, and a timed-out command is not
+automatically resent because the cloud may already have accepted it.
+Overlapping polls and command readbacks use a shared request sequence so an
+older response cannot overwrite newer readings or availability.
+
+Combined `climate.set_temperature` calls validate the requested HVAC mode and
+temperature together, then submit one command. For example, a call with
+`hvac_mode: heat` sets the heating target even when the unit is currently cooling
+or off.
+
+Temporary failures or empty responses from the optional device-profile endpoint
+retain the last valid capabilities and temperature limits, allowing controls to
+continue working. A successful profile refresh replaces the cached profile.
 
 ### Temperature conversion
 
@@ -142,11 +154,18 @@ lookup table for setpoints and display, eliminating the ~1 °F drift that
 standard rounding causes for Fahrenheit users. Values outside the lookup
 table fall back to standard conversion.
 
+When Home Assistant uses Celsius, readings and setpoints stay in Celsius and
+use 0.5 °C setpoint steps. Changing HA's unit system updates the climate entity's
+conversion behavior without requiring a reload. Fractional Fahrenheit inputs
+retain the existing nearest-whole-Fahrenheit lookup behavior within the table.
+
 ### Authentication failures
 
-A 403 from the Kumo Cloud API raises `KumoCloudAuthError`, which Home Assistant
-maps to `ConfigEntryAuthFailed` — surfacing the re-authentication prompt in
-the UI rather than entering a retry loop.
+An authenticated request rejected with 401 or 403 gets one token refresh and
+one retry. Concurrent requests share token rotation, and replacement tokens
+are saved to the config entry. If authentication still fails, Home Assistant
+prompts for reauthentication. This applies to polling and command requests;
+network failures remain connection errors.
 
 ## Comparison to other Mitsubishi integrations
 
