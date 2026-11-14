@@ -3,24 +3,23 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any
 
 import aiohttp
-from aiohttp import ClientResponseError, ClientTimeout
-
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from aiohttp import ClientResponseError
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import (
+    API_APP_VERSION,
     API_BASE_URL,
     API_VERSION,
-    API_APP_VERSION,
-    TOKEN_REFRESH_INTERVAL,
     TOKEN_EXPIRY_MARGIN,
+    TOKEN_REFRESH_INTERVAL,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -41,7 +40,9 @@ class KumoCloudConnectionError(KumoCloudError):
 class KumoCloudAPI:
     """Kumo Cloud API client."""
 
-    def __init__(self, hass: HomeAssistant) -> None:
+    def __init__(
+        self, hass: HomeAssistant, on_token_update: Callable[[], None] | None = None
+    ) -> None:
         """Initialize the API client."""
         self.hass = hass
         self.session = async_get_clientsession(hass)
@@ -50,6 +51,31 @@ class KumoCloudAPI:
         self.access_token: str | None = None
         self.refresh_token: str | None = None
         self.token_expires_at: datetime | None = None
+        self._on_token_update = on_token_update
+        self._refresh_lock = asyncio.Lock()
+        self._token_generation = 0
+        self._auth_failed = False
+
+    def _store_tokens(self, tokens: dict[str, Any]) -> None:
+        """Publish and persist a complete token pair before another request runs."""
+        if not isinstance(tokens, dict):
+            raise KumoCloudConnectionError("Cloud returned an invalid token pair")
+        access, refresh = tokens.get("access"), tokens.get("refresh")
+        if (
+            not isinstance(access, str)
+            or not access
+            or not isinstance(refresh, str)
+            or not refresh
+        ):
+            raise KumoCloudConnectionError("Cloud returned an invalid token pair")
+        self.access_token, self.refresh_token = access, refresh
+        self.token_expires_at = datetime.now() + timedelta(
+            seconds=TOKEN_REFRESH_INTERVAL
+        )
+        self._token_generation += 1
+        self._auth_failed = False
+        if self._on_token_update:
+            self._on_token_update()
 
     async def login(self, username: str, password: str) -> dict[str, Any]:
         """Login to Kumo Cloud and return user data."""
@@ -69,33 +95,46 @@ class KumoCloudAPI:
                 async with self.session.post(
                     url, headers=headers, json=data
                 ) as response:
-                    if response.status == 403:
+                    if response.status in (401, 403):
                         raise KumoCloudAuthError("Invalid username or password")
                     response.raise_for_status()
                     result = await response.json()
 
                     self.username = username
-                    self.access_token = result["token"]["access"]
-                    self.refresh_token = result["token"]["refresh"]
-                    self.token_expires_at = datetime.now() + timedelta(
-                        seconds=TOKEN_REFRESH_INTERVAL
-                    )
+                    self._store_tokens(result["token"])
 
                     return result
 
-        except asyncio.TimeoutError as err:
+        except TimeoutError as err:
             raise KumoCloudConnectionError("Connection timeout") from err
         except ClientResponseError as err:
-            if err.status == 403:
+            if err.status in (401, 403):
                 raise KumoCloudAuthError("Invalid credentials") from err
             raise KumoCloudConnectionError(f"HTTP error: {err.status}") from err
         except KumoCloudError:
             raise
+        except (ValueError, KeyError, TypeError) as err:
+            raise KumoCloudConnectionError("Invalid login response") from err
         except Exception as err:
             raise KumoCloudConnectionError(f"Unexpected error: {err}") from err
 
-    async def refresh_access_token(self) -> None:
-        """Refresh the access token."""
+    async def refresh_access_token(self, *, generation: int | None = None) -> None:
+        """Refresh once for concurrent callers using the same token generation."""
+        if generation is None:
+            generation = self._token_generation
+        async with self._refresh_lock:
+            if self._auth_failed:
+                raise KumoCloudAuthError("Authentication requires reauthorization")
+            if generation != self._token_generation:
+                return
+            try:
+                await self._refresh_access_token()
+            except KumoCloudAuthError:
+                self._auth_failed = True
+                raise
+
+    async def _refresh_access_token(self) -> None:
+        """Rotate tokens while holding the account refresh lock."""
         if not self.refresh_token:
             raise KumoCloudAuthError("No refresh token available")
 
@@ -111,30 +150,32 @@ class KumoCloudAPI:
                 async with self.session.post(
                     url, headers=headers, json=data
                 ) as response:
-                    if response.status == 401:
+                    if response.status in (401, 403):
                         raise KumoCloudAuthError("Refresh token expired")
                     response.raise_for_status()
                     result = await response.json()
 
-                    self.access_token = result["access"]
-                    self.refresh_token = result["refresh"]
-                    self.token_expires_at = datetime.now() + timedelta(
-                        seconds=TOKEN_REFRESH_INTERVAL
-                    )
+                    self._store_tokens(result)
 
-        except asyncio.TimeoutError as err:
+        except TimeoutError as err:
             raise KumoCloudConnectionError("Connection timeout during refresh") from err
         except ClientResponseError as err:
-            if err.status == 401:
+            if err.status in (401, 403):
                 raise KumoCloudAuthError("Refresh token expired") from err
             raise KumoCloudConnectionError(
                 f"HTTP error during refresh: {err.status}"
             ) from err
         except (aiohttp.ClientError, OSError) as err:
-            raise KumoCloudConnectionError(f"Connection error during refresh: {err}") from err
+            raise KumoCloudConnectionError(
+                f"Connection error during refresh: {err}"
+            ) from err
+        except (ValueError, KeyError, TypeError) as err:
+            raise KumoCloudConnectionError("Invalid token refresh response") from err
 
     async def _ensure_token_valid(self) -> None:
         """Ensure access token is valid, refresh if needed."""
+        if self._auth_failed:
+            raise KumoCloudAuthError("Authentication requires reauthorization")
         if not self.access_token:
             raise KumoCloudAuthError("No access token available")
 
@@ -148,9 +189,25 @@ class KumoCloudAPI:
     async def _request(
         self, method: str, endpoint: str, data: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        """Make an authenticated request to the API."""
+        """Recover a rejected token once, for both polls and commands."""
         await self._ensure_token_valid()
+        for attempt in range(2):
+            generation = self._token_generation
+            try:
+                return await self._request_with_retries(method, endpoint, data)
+            except KumoCloudAuthError:
+                if attempt:
+                    # Do not invalidate a newer token installed by another request.
+                    if generation == self._token_generation:
+                        self._auth_failed = True
+                    raise
+                await self.refresh_access_token(generation=generation)
+        raise KumoCloudAuthError("Authentication failed")
 
+    async def _request_with_retries(
+        self, method: str, endpoint: str, data: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        """Retry reads and explicit throttling, never an ambiguous command timeout."""
         url = f"{self.base_url}/{API_VERSION}{endpoint}"
         headers = {
             "x-app-version": API_APP_VERSION,
@@ -160,7 +217,7 @@ class KumoCloudAPI:
 
         max_retries = 3
         base_delay = 60
-        
+
         for attempt in range(max_retries + 1):
             try:
                 async with asyncio.timeout(30):
@@ -177,9 +234,9 @@ class KumoCloudAPI:
                                 return await response.json()
                             return {}
 
-            except asyncio.TimeoutError as err:
-                if attempt < max_retries:
-                    delay = base_delay * (2 ** attempt)
+            except TimeoutError as err:
+                if method.upper() == "GET" and attempt < max_retries:
+                    delay = base_delay * (2**attempt)
                     _LOGGER.warning(
                         "Request timeout (attempt %d/%d), retrying in %d seconds",
                         attempt + 1,
@@ -193,7 +250,7 @@ class KumoCloudAPI:
                 if err.status in (401, 403):
                     raise KumoCloudAuthError("Authentication failed") from err
                 if err.status == 429 and attempt < max_retries:
-                    delay = base_delay * (2 ** attempt)
+                    delay = base_delay * (2**attempt)
                     _LOGGER.warning(
                         "Rate limited (429), retrying in %d seconds (attempt %d/%d)",
                         delay,
@@ -255,7 +312,9 @@ class KumoCloudAPI:
                 return None
             raise
 
-    async def get_zone_notification_preferences(self, zone_id: str) -> dict[str, Any] | None:
+    async def get_zone_notification_preferences(
+        self, zone_id: str
+    ) -> dict[str, Any] | None:
         """Get zone notification preferences (filter reminders, alert settings).
 
         Endpoint: GET /v3/zones/{zoneId}/notification-preferences
@@ -263,7 +322,9 @@ class KumoCloudAPI:
                  sensorLowBattery, sensorSignalLost, lowTemp, highTemp, etc.
         """
         try:
-            return await self._request("GET", f"/zones/{zone_id}/notification-preferences")
+            return await self._request(
+                "GET", f"/zones/{zone_id}/notification-preferences"
+            )
         except KumoCloudConnectionError as err:
             if "404" in str(err):
                 return None
@@ -274,4 +335,11 @@ class KumoCloudAPI:
     ) -> dict[str, Any]:
         """Send command to device."""
         data = {"deviceSerial": device_serial, "commands": commands}
-        return await self._request("POST", "/devices/send-command", data)
+        response = await self._request("POST", "/devices/send-command", data)
+        if isinstance(response, dict) and (
+            response.get("success") is False
+            or response.get("error")
+            or response.get("errors")
+        ):
+            raise KumoCloudConnectionError("Cloud rejected the command")
+        return response

@@ -4,21 +4,37 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from time import monotonic
 from typing import Any
 
 import aiohttp
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
 from .api import KumoCloudAPI, KumoCloudAuthError, KumoCloudConnectionError
-from .const import DOMAIN, DEFAULT_SCAN_INTERVAL, DEVICE_TELEMETRY_MAX_AGE
+from .const import (
+    COMMAND_CACHE_TTL,
+    DEFAULT_SCAN_INTERVAL,
+    DEVICE_TELEMETRY_MAX_AGE,
+    DOMAIN,
+)
 
 type KumoCloudConfigEntry = ConfigEntry["KumoCloudDataUpdateCoordinator"]
 
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class PendingCommand:
+    """An accepted setting awaiting device confirmation, never raw telemetry."""
+
+    value: Any
+    expires_at: float
 
 
 def _parse_updated_at(value: Any) -> datetime | None:
@@ -37,13 +53,21 @@ def _parse_updated_at(value: Any) -> datetime | None:
 class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
     """Class to manage fetching Kumo Cloud data."""
 
-    def __init__(self, hass: HomeAssistant, api: KumoCloudAPI, site_id: str) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        api: KumoCloudAPI,
+        site_id: str,
+        *,
+        config_entry: KumoCloudConfigEntry | None = None,
+    ) -> None:
         """Initialize the coordinator."""
         super().__init__(
             hass,
             _LOGGER,
             name=DOMAIN,
             update_interval=timedelta(seconds=DEFAULT_SCAN_INTERVAL),
+            config_entry=config_entry,
         )
         self.api = api
         self.site_id = site_id
@@ -57,19 +81,30 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
         self.device_statuses: dict[str, dict[str, Any]] = {}
         self.zone_notifications: dict[str, dict[str, Any]] = {}
 
-        # Instance variable to store cached commands
-        self.cached_commands: dict[tuple[str, str], tuple[str, Any]] = {}
+        self.cached_commands: dict[tuple[str, str], PendingCommand] = {}
+        self.command_locks: dict[str, asyncio.Lock] = {}
+        self.device_revisions: dict[str, int] = {}
+        self._pending_expiry: asyncio.TimerHandle | None = None
 
-    def _process_pending_commands(self, device_serial: str, device_detail: dict[str, Any]) -> None:
-        """Process cached commands and cull outdated commands for a device."""
-        # Check if the device already exists and the updatedAt matches
-        if device_serial in self.devices and "updatedAt" in device_detail:
-            self.cull_cached_commands(device_serial, device_detail.get("updatedAt"))
-
-        # Reapply cached commands to the device details
-        for (cached_device_serial, command), (_, command_value) in self.cached_commands.items():
-            if cached_device_serial == device_serial:
-                device_detail[command] = command_value
+    def _process_pending_commands(
+        self, device_serial: str, device_detail: dict[str, Any]
+    ) -> None:
+        """Acknowledge matching values without altering the cloud response."""
+        self._expire_pending_commands()
+        for key, pending in list(self.cached_commands.items()):
+            serial, command = key
+            if serial != device_serial:
+                continue
+            actual = device_detail.get(command)
+            if command == "operationMode":
+                if actual in ("autoHeat", "autoCool"):
+                    actual = "auto"
+                # Some adapters retain their mode while powered off.
+                if device_detail.get("power") == 0:
+                    actual = "off"
+            if actual == pending.value:
+                del self.cached_commands[key]
+        self._schedule_pending_expiry()
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from Kumo Cloud."""
@@ -79,6 +114,7 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
 
             # Get device details for each zone
             devices = {}
+            revisions = {}
             device_update_success = {}
             device_profiles = {}
             wireless_sensors = {}
@@ -86,8 +122,11 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
             zone_notifications = {}
 
             for zone in zones:
-                if "adapter" in zone and zone["adapter"]:
+                if zone.get("adapter"):
                     device_serial = zone["adapter"]["deviceSerial"]
+                    revisions[device_serial] = self.device_revisions.get(
+                        device_serial, 0
+                    )
                     zone_id = zone["id"]
                     has_sensor = zone["adapter"].get("hasSensor", False)
 
@@ -109,17 +148,23 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
                     # Process results by key
                     result_map = {}
                     for key, result in zip(task_keys, results):
+                        if isinstance(result, KumoCloudAuthError):
+                            raise result
+                        if isinstance(result, asyncio.CancelledError):
+                            raise result
                         if isinstance(result, Exception):
-                            _LOGGER.debug("Failed to fetch %s for %s: %s", key, device_serial, result)
+                            _LOGGER.debug(
+                                "Failed to fetch %s for %s: %s",
+                                key,
+                                device_serial,
+                                result,
+                            )
                             result_map[key] = None
                         else:
                             result_map[key] = result
 
                     device_detail = result_map.get("detail") or {}
                     device_update_success[device_serial] = bool(device_detail)
-
-                    # Process pending commands for the device
-                    self._process_pending_commands(device_serial, device_detail)
 
                     devices[device_serial] = device_detail
                     device_profiles[device_serial] = result_map.get("profile") or []
@@ -132,6 +177,17 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
 
                     if has_sensor and result_map.get("sensor"):
                         wireless_sensors[device_serial] = result_map["sensor"]
+
+            # A poll can overlap a command and its newer readback while fetching
+            # other endpoints/units. Never replace that state with the older poll.
+            for serial, detail in devices.items():
+                if revisions[serial] != self.device_revisions.get(serial, 0):
+                    devices[serial] = self.devices.get(serial, {})
+                    device_update_success[serial] = self.device_update_success.get(
+                        serial, False
+                    )
+                else:
+                    self._process_pending_commands(serial, detail)
 
             # Store the data for access by entities
             self.zones = zones
@@ -152,28 +208,18 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
             }
 
         except KumoCloudAuthError as err:
-            # Reactive token refresh: a 401 surfaced mid-poll, despite
-            # `api._ensure_token_valid` doing proactive refresh on each call.
-            # Try to refresh once and replay the poll; if that fails, give up
-            # and let HA mark the entry stale / trigger a re-auth flow.
-            try:
-                await self.api.refresh_access_token()
-                return await self._async_update_data()
-            except KumoCloudAuthError as refresh_err:
-                raise UpdateFailed(
-                    f"Authentication failed: {refresh_err}"
-                ) from refresh_err
-            except (KumoCloudConnectionError, aiohttp.ClientError, OSError, asyncio.TimeoutError) as refresh_err:
-                raise UpdateFailed(
-                    f"Error during token refresh: {refresh_err}"
-                ) from refresh_err
+            # The API has already attempted bounded recovery. Let HA reauthorize.
+            raise ConfigEntryAuthFailed("Cloud authentication failed") from err
         except KumoCloudConnectionError as err:
             raise UpdateFailed(f"Error communicating with API: {err}") from err
-        except (aiohttp.ClientError, OSError, asyncio.TimeoutError) as err:
+        except (TimeoutError, aiohttp.ClientError, OSError) as err:
             raise UpdateFailed(f"Connection error: {err}") from err
 
     async def async_refresh_device(self, device_serial: str) -> None:
         """Refresh a specific device's data immediately."""
+        self.device_revisions[device_serial] = (
+            self.device_revisions.get(device_serial, 0) + 1
+        )
         try:
             # Get fresh device details
             device_detail = await self.api.get_device_details(device_serial)
@@ -187,22 +233,24 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
 
             # Also update the zone data if it contains the same info
             for zone in self.zones:
-                if "adapter" in zone and zone["adapter"]:
-                    if zone["adapter"]["deviceSerial"] == device_serial:
-                        # Update adapter data with fresh device data
-                        zone["adapter"].update(
-                            {
-                                "roomTemp": device_detail.get("roomTemp"),
-                                "operationMode": device_detail.get("operationMode"),
-                                "power": device_detail.get("power"),
-                                "fanSpeed": device_detail.get("fanSpeed"),
-                                "airDirection": device_detail.get("airDirection"),
-                                "spCool": device_detail.get("spCool"),
-                                "spHeat": device_detail.get("spHeat"),
-                                "humidity": device_detail.get("humidity"),
-                            }
-                        )
-                        break
+                if (
+                    zone.get("adapter")
+                    and zone["adapter"]["deviceSerial"] == device_serial
+                ):
+                    # Update adapter data with fresh device data
+                    zone["adapter"].update(
+                        {
+                            "roomTemp": device_detail.get("roomTemp"),
+                            "operationMode": device_detail.get("operationMode"),
+                            "power": device_detail.get("power"),
+                            "fanSpeed": device_detail.get("fanSpeed"),
+                            "airDirection": device_detail.get("airDirection"),
+                            "spCool": device_detail.get("spCool"),
+                            "spHeat": device_detail.get("spHeat"),
+                            "humidity": device_detail.get("humidity"),
+                        }
+                    )
+                    break
 
             # Update the coordinator's data dict
             self.data = {
@@ -219,61 +267,75 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
 
             _LOGGER.debug("Refreshed device %s data", device_serial)
 
+        except KumoCloudAuthError as err:
+            self.device_update_success[device_serial] = False
+            self.async_auth_failed()
+            raise ConfigEntryAuthFailed("Cloud authentication failed") from err
         except (
-            KumoCloudAuthError,
+            TimeoutError,
             KumoCloudConnectionError,
             aiohttp.ClientError,
             OSError,
-            asyncio.TimeoutError,
         ) as err:
             self.device_update_success[device_serial] = False
             self.async_update_listeners()
             _LOGGER.warning("Failed to refresh device %s: %s", device_serial, err)
 
+    def async_auth_failed(self) -> None:
+        """Start reauthentication for failures outside scheduled coordinator polls."""
+        self.last_update_success = False
+        if self.config_entry:
+            self.config_entry.async_start_reauth(self.hass)
+        self.async_update_listeners()
+
     def cache_command(self, device_serial: str, command: str, value: Any) -> None:
-        """Cache a command with its value and timestamp."""
-        current_time = datetime.now(timezone.utc).isoformat()
-        self.cached_commands[(device_serial, command)] = (current_time, value)
-        _LOGGER.debug("Cached command in device data: %s at %s", command, current_time)
-
-    def cull_cached_commands(self, device_serial: str, date: str) -> None:
-        """Remove cached commands for a device where the date is on or after the item's timestamp."""
-        input_date = _parse_updated_at(date)
-        if input_date is None:
-            return
-        to_remove = []
-
-        for key, value in self.cached_commands.items():
-            cached_device_serial, command = key
-            cached_date, _ = value
-            cached_date_obj = datetime.fromisoformat(cached_date)
-
-            # Check if the device_serial matches and the input date is on or after the cached date
-            if cached_device_serial == device_serial and input_date >= cached_date_obj:
-                to_remove.append(key)
-            else:
-                # Log details if the condition fails
-                _LOGGER.debug(
-                    "Skipping cached command: cached_device_serial=%s, device_serial=%s, "
-                    "input_date=%s, cached_date_obj=%s, date=%s, cached_date=%s",
-                    cached_device_serial,
-                    device_serial,
-                    input_date,
-                    cached_date_obj,
-                    date,
-                    cached_date,
-                )
-
-        # Remove the matching keys
-        for key in to_remove:
-            del self.cached_commands[key]
-
-        # Log the culled and remaining commands
-        remaining_count = len(self.cached_commands)
-        _LOGGER.debug(
-            "Culled %d cached commands for device %s on or after %s. Remaining cached commands: %d",
-            len(to_remove), device_serial, date, remaining_count
+        """Track an accepted setting for a bounded confirmation window."""
+        self.cached_commands[(device_serial, command)] = PendingCommand(
+            value, monotonic() + COMMAND_CACHE_TTL
         )
+        self._schedule_pending_expiry()
+
+    def pending_commands(self, device_serial: str) -> dict[str, Any]:
+        """Return unexpired requested settings separately from measured state."""
+        self._expire_pending_commands()
+        return {
+            command: pending.value
+            for (serial, command), pending in self.cached_commands.items()
+            if serial == device_serial
+        }
+
+    def _expire_pending_commands(self) -> None:
+        now = monotonic()
+        for key, pending in list(self.cached_commands.items()):
+            if now >= pending.expires_at:
+                del self.cached_commands[key]
+
+    def _schedule_pending_expiry(self) -> None:
+        if self._pending_expiry:
+            self._pending_expiry.cancel()
+            self._pending_expiry = None
+        if self.cached_commands:
+            delay = max(
+                0,
+                min(p.expires_at for p in self.cached_commands.values()) - monotonic(),
+            )
+            self._pending_expiry = self.hass.loop.call_later(
+                delay, self._pending_expired
+            )
+
+    def _pending_expired(self) -> None:
+        self._pending_expiry = None
+        self._expire_pending_commands()
+        self._schedule_pending_expiry()
+        self.async_update_listeners()
+
+    async def async_shutdown(self) -> None:
+        """Cancel optimistic-state timers when the entry unloads."""
+        if self._pending_expiry:
+            self._pending_expiry.cancel()
+            self._pending_expiry = None
+        await super().async_shutdown()
+
 
 class KumoCloudDevice:
     """Representation of a Kumo Cloud device."""
@@ -306,6 +368,15 @@ class KumoCloudDevice:
         """Get the device data."""
         # Always get fresh data from coordinator
         return self.coordinator.devices.get(self.device_serial, {})
+
+    @property
+    def control_data(self) -> dict[str, Any]:
+        """Combine latest readings and pending controls without changing telemetry."""
+        pending = self.coordinator.pending_commands(self.device_serial)
+        data = {**self.zone_data.get("adapter", {}), **self.device_data, **pending}
+        if "operationMode" in pending:
+            data["power"] = 0 if pending["operationMode"] == "off" else 1
+        return data
 
     @property
     def profile_data(self) -> list[dict[str, Any]]:
@@ -374,34 +445,25 @@ class KumoCloudDevice:
         return f"{self.device_serial}_{self.zone_id}"
 
     async def send_command(self, commands: dict[str, Any]) -> None:
-        """Send a command to the device and refresh status."""
-        try:
-            response = await self.coordinator.api.send_command(self.device_serial, commands)
-            _LOGGER.debug("Sent command to device %s: %s, Response: %s", self.device_serial, commands, response)
+        """Serialize writes and publish optimistic settings only after acceptance."""
+        lock = self.coordinator.command_locks.setdefault(
+            self.device_serial, asyncio.Lock()
+        )
+        async with lock:
+            try:
+                await self.coordinator.api.send_command(self.device_serial, commands)
+            except KumoCloudAuthError as err:
+                self.coordinator.async_auth_failed()
+                raise ConfigEntryAuthFailed("Cloud authentication failed") from err
 
-            # Wait a moment for the command to be processed
-            await asyncio.sleep(1)
-
-            # Refresh this specific device's data immediately
-            await self.coordinator.async_refresh_device(self.device_serial)
-
-        except (
-            KumoCloudAuthError,
-            KumoCloudConnectionError,
-            aiohttp.ClientError,
-            OSError,
-            asyncio.TimeoutError,
-        ) as err:
-            _LOGGER.error(
-                "Failed to send command to device %s: %s", self.device_serial, err
+            self.coordinator.device_revisions[self.device_serial] = (
+                self.coordinator.device_revisions.get(self.device_serial, 0) + 1
             )
-            raise
+            for command, value in commands.items():
+                self.coordinator.cache_command(self.device_serial, command, value)
+            self.coordinator.async_update_listeners()
 
-    def cache_command(self, command: str, value: Any) -> None:
-        """Cache a command with its value and timestamp in the coordinator."""
-        self.coordinator.cache_command(self.device_serial, command, value)
-
-    def cache_commands(self, commands: dict[str, Any]) -> None:
-        """Cache multiple commands with their values and timestamps in the coordinator."""
-        for command, value in commands.items():
-            self.cache_command(command, value)
+            # Failed readback does not make an accepted command a rejected one.
+            # Pending settings remain bounded by their original expiration time.
+            await asyncio.sleep(1)
+            await self.coordinator.async_refresh_device(self.device_serial)

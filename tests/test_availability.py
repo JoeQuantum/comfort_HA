@@ -6,7 +6,7 @@ Run with: python -m unittest discover -s tests -v
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import IsolatedAsyncioTestCase, TestCase
@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, patch
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import frame
+from homeassistant.util.unit_system import US_CUSTOMARY_SYSTEM
 
 from custom_components.kumo_cloud.api import KumoCloudConnectionError
 from custom_components.kumo_cloud.climate import KumoCloudClimate
@@ -23,7 +24,7 @@ from custom_components.kumo_cloud.coordinator import (
     KumoCloudDevice,
 )
 
-NOW = datetime(2026, 11, 13, 18, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 11, 13, 18, 0, tzinfo=UTC)
 
 
 def detail(serial: str = "unit-a", **changes) -> dict:
@@ -56,6 +57,7 @@ class AvailabilityTests(TestCase):
         ).start()
         self.addCleanup(patch.stopall)
         self.coordinator = SimpleNamespace(
+            hass=SimpleNamespace(config=SimpleNamespace(units=US_CUSTOMARY_SYSTEM)),
             zones=[zone()],
             devices={"unit-a": detail()},
             device_profiles={},
@@ -211,7 +213,7 @@ class CoordinatorAvailabilityTests(IsolatedAsyncioTestCase):
 
     async def test_partial_device_failure_does_not_hide_behind_cached_commands(self):
         await self.coordinator.async_refresh()
-        self.coordinator.cached_commands[("unit-a", "spHeat")] = (NOW.isoformat(), 22)
+        self.coordinator.cache_command("unit-a", "spHeat", 22)
 
         def respond(serial):
             if serial == "unit-a":
@@ -221,7 +223,7 @@ class CoordinatorAvailabilityTests(IsolatedAsyncioTestCase):
         self.api.get_device_details.side_effect = respond
         await self.coordinator.async_refresh()
         self.assertTrue(self.coordinator.last_update_success)
-        self.assertEqual(self.coordinator.devices["unit-a"], {"spHeat": 22})
+        self.assertEqual(self.coordinator.devices["unit-a"], {})
         self.assertIs(self.entity_a.available, False)
         self.assertIs(self.entity_b.available, True)
         self.api.get_device_details.side_effect = lambda serial: detail(serial)
@@ -229,12 +231,12 @@ class CoordinatorAvailabilityTests(IsolatedAsyncioTestCase):
         self.assertIs(self.entity_a.available, True)
 
     async def test_empty_device_response_is_not_restored_by_cached_commands(self):
-        self.coordinator.cached_commands[("unit-a", "spHeat")] = (NOW.isoformat(), 22)
-        self.api.get_device_details.side_effect = (
-            lambda serial: {} if serial == "unit-a" else detail(serial)
+        self.coordinator.cache_command("unit-a", "spHeat", 22)
+        self.api.get_device_details.side_effect = lambda serial: (
+            {} if serial == "unit-a" else detail(serial)
         )
         await self.coordinator.async_refresh()
-        self.assertEqual(self.coordinator.devices["unit-a"], {"spHeat": 22})
+        self.assertEqual(self.coordinator.devices["unit-a"], {})
         self.assertIs(self.entity_a.available, False)
         self.assertIs(self.entity_b.available, True)
 
@@ -280,7 +282,7 @@ class CoordinatorAvailabilityTests(IsolatedAsyncioTestCase):
 
     async def test_empty_direct_refresh_is_not_restored_by_cached_commands(self):
         await self.coordinator.async_refresh()
-        self.coordinator.cached_commands[("unit-a", "spHeat")] = (NOW.isoformat(), 22)
+        self.coordinator.cache_command("unit-a", "spHeat", 22)
         self.api.get_device_details.side_effect = None
         self.api.get_device_details.return_value = {}
         await self.coordinator.async_refresh_device("unit-a")
@@ -296,7 +298,7 @@ class CoordinatorAvailabilityTests(IsolatedAsyncioTestCase):
 
     async def test_invalid_timestamps_do_not_break_pending_command_processing(self):
         await self.coordinator.async_refresh()
-        self.coordinator.cached_commands[("unit-a", "spHeat")] = (NOW.isoformat(), 22)
+        self.coordinator.cache_command("unit-a", "spHeat", 22)
         for updated_at in [
             None,
             "bad-date",
@@ -304,8 +306,10 @@ class CoordinatorAvailabilityTests(IsolatedAsyncioTestCase):
             "2026-11-13T18:00:00",
         ]:
             with self.subTest(updated_at=updated_at):
-                self.api.get_device_details.side_effect = lambda serial: detail(
-                    serial, updatedAt=updated_at
+                self.api.get_device_details.side_effect = (
+                    lambda serial, updated_at=updated_at: detail(
+                        serial, updatedAt=updated_at
+                    )
                 )
                 await self.coordinator.async_refresh()
                 self.assertTrue(self.coordinator.last_update_success)
@@ -314,7 +318,10 @@ class CoordinatorAvailabilityTests(IsolatedAsyncioTestCase):
 
     async def test_fresh_confirmed_telemetry_still_culls_cached_commands(self):
         await self.coordinator.async_refresh()
-        self.coordinator.cached_commands[("unit-a", "spHeat")] = (NOW.isoformat(), 22)
+        self.coordinator.cache_command("unit-a", "spHeat", 22)
+        self.api.get_device_details.side_effect = lambda serial: detail(
+            serial, spHeat=22
+        )
         await self.coordinator.async_refresh()
         self.assertNotIn(("unit-a", "spHeat"), self.coordinator.cached_commands)
         self.assertIs(self.entity_a.available, True)
